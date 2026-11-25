@@ -65,8 +65,12 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+mock_llm_pid=""
 
 cleanup() {
+  if [ -n "${mock_llm_pid}" ]; then
+    kill "${mock_llm_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +195,83 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+docker_host_args=()
+used_mock_llm=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: using supplied endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  used_mock_llm=1
+  python3 - "${work_dir}/mock_llm.port" "${work_dir}/mock_llm_calls.jsonl" <<'PY' &
+import http.server, json, sys
+from pathlib import Path
+
+port_file, log_file = Path(sys.argv[1]), Path(sys.argv[2])
+calls = 0
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+    def do_POST(self):
+        global calls
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        req = json.loads(body)
+        user = req["messages"][0]["content"]
+        calls += 1
+        if '"check"' in user:
+            action = "bet" if ('"bet"' in user and calls % 2 == 1) else "check"
+        else:
+            action = "fold" if calls % 3 == 1 else "call"
+        say = "Tap tap." if calls % 4 == 0 else ""
+        raw_obj = json.dumps({"say": say, "action": action})
+        text = f"```json\n{raw_obj}\n```" if calls % 2 == 0 else raw_obj
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"call": calls, "slot": self.headers.get("X-Coworld-Player-Slot"), "action": action}) + "\n")
+        resp = {
+            "id": f"smoke-{calls}",
+            "type": "message",
+            "role": "assistant",
+            "model": req.get("model", "local/deterministic-smoke"),
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        encoded = json.dumps(resp).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+port_file.write_text(str(server.server_port))
+server.serve_forever()
+PY
+  mock_llm_pid=$!
+  for _ in $(seq 1 50); do
+    if [ -s "${work_dir}/mock_llm.port" ]; then break; fi
+    sleep 0.1
+  done
+  mock_port="$(cat "${work_dir}/mock_llm.port")"
+  if [ "$(uname -s)" = "Linux" ]; then
+    docker_host_args+=(--add-host=host.docker.internal:host-gateway)
+  fi
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}")
+  game_env+=(-e "COWORLD_LLM_MODEL=local/deterministic-smoke")
+  echo "started local deterministic HTTP model service on port ${mock_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${docker_host_args[@]+"${docker_host_args[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -272,7 +343,7 @@ echo "all ${seats} player containers exited 0"
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${used_mock_llm}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -280,6 +351,7 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+used_mock_llm = sys.argv[4] == "1"
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -303,6 +375,21 @@ for key in ("names", "scores"):
     else:
         print(f"WARNING: results.json has no '{key}' key")
 
+if results.get("fallbacks") and any(x != 0 for x in results["fallbacks"]):
+    raise SystemExit(f"unexpected fallbacks in results.json: {results['fallbacks']}")
+if results.get("forcedFolds") and any(x != 0 for x in results["forcedFolds"]):
+    raise SystemExit(f"unexpected forcedFolds in results.json: {results['forcedFolds']}")
+
+mock_calls = 0
+if used_mock_llm:
+    calls_path = work / "mock_llm_calls.jsonl"
+    if not calls_path.exists():
+        raise SystemExit("local deterministic HTTP model service received 0 calls")
+    lines = [ln for ln in calls_path.read_text().splitlines() if ln.strip()]
+    mock_calls = len(lines)
+    if mock_calls == 0:
+        raise SystemExit("local deterministic HTTP model service received 0 calls")
+
 reason = results.get("reason") or results.get("end_reason")
 if reason is not None:
     print(f"episode end reason: {reason}")
@@ -321,7 +408,7 @@ if require_replay_json:
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "
-    f"replay={replay_path.stat().st_size}B reason={reason}"
+    f"replay={replay_path.stat().st_size}B reason={reason} http_calls={mock_calls}"
 )
 PY
 then

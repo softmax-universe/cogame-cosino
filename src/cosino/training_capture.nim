@@ -478,6 +478,58 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
   except CatchableError as error:
     capture.captureError("applied evidence failed: " & error.msg)
 
+proc recordRejected*(capture: RuntimeCapture, decision: CapturedDecision,
+    seat: int, reason, origin, rawReply, postHash: string) =
+  if capture == nil or decision == nil: return
+  try:
+    decision.observation["native_execution"] = %*{
+      "events": newJArray(),
+      "post_native_sha256": postHash,
+      "origin": origin,
+      "rejected": true,
+      "rejection_reason": safeDiagnostic(reason),
+      "raw_reply": safeDiagnostic(rawReply)
+    }
+    var originalAttempts = newJArray()
+    for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
+    let original = %*{"observation": decision.observation, "attempts": originalAttempts,
+      "executed_action": newJNull(), "actual_scripted": false}
+    if not scalarJson(original):
+      let detail = "non-Unicode native evidence; original JSON bytes retained as base64; target excluded"
+      decision.observation = %*{"capture_errors": [detail],
+        "actual_scripted": false,
+        "invalid_native_evidence_json_b64": encode($original)}
+      decision.attempts = @[]
+      decision.failed = true
+    if decision.failed:
+      capture.failed = true
+      if decision.observation.hasKey("capture_errors"):
+        for error in decision.observation["capture_errors"]:
+          if capture.errors.len < 16: capture.errors.add(error.getStr())
+    if capture.trajectory != nil:
+      capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
+        decision.attempts, none(string), newJNull(), asRejected, terminal = true)
+  except CatchableError as error:
+    capture.captureError("rejected evidence failed: " & error.msg)
+
+proc finishCaptureFailed*(capture: RuntimeCapture, failure: JsonNode) =
+  if capture == nil: return
+  try:
+    if capture.trajectory == nil:
+      raise newException(ValueError, "trajectory initialization failed")
+    var privateOutcome = copy(failure)
+    if not scalarJson(privateOutcome):
+      capture.captureError("non-Unicode failure outcome; original JSON bytes retained as base64")
+      privateOutcome = %*{"invalid_native_outcome_json_b64": encode($failure)}
+    if capture.errors.len > 0:
+      privateOutcome["capture_errors"] = %capture.errors
+    capture.trajectory.finish(esFailed, privateOutcome, newJNull())
+    if capture.trajectory.eventsJsonl().len > MaxEpisodeEvidenceBytes:
+      raise newException(ValueError, "private episode exceeds 24 MiB; publication omitted, no truncation")
+    capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  except CatchableError as error:
+    echo "cosino: private capture failure publication failed: ", safeDiagnostic(error.msg)
+
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return
   try:

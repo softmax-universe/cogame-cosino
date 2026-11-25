@@ -30,13 +30,24 @@ when isMainModule:
   if prompt.len == 0:
     prompt = DefaultPrompt
   let scriptedEnv = getEnv("PLAYER_SCRIPTED").strip()
-  let scripted = scriptedEnv.len > 0 and scriptedEnv notin ["0", "false", "no"]
-  let baseline =
-    if scriptedEnv.toLowerAscii() == "rock": "rock" else: "house"
+  let scriptedLower = scriptedEnv.toLowerAscii()
+  var scripted = false
+  var baseline = "house"
+  if scriptedLower.len == 0 or scriptedLower in ["0", "false", "no"]:
+    scripted = false
+  elif scriptedLower in ["house", "rock"]:
+    scripted = true
+    baseline = scriptedLower
+  else:
+    quit("unknown PLAYER_SCRIPTED baseline: " & scriptedEnv &
+      " (expected house or rock)", 1)
 
   proc promptFrame(): string =
-    $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted,
-         "baseline": baseline}
+    if scripted:
+      $ %*{"type": "prompt", "prompt": prompt, "scripted": true,
+           "baseline": baseline}
+    else:
+      $ %*{"type": "prompt", "prompt": prompt, "scripted": false}
 
   echo "cosino player: connecting to game"
   let socket = newWebSocket(url)

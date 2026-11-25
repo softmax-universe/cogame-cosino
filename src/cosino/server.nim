@@ -56,6 +56,8 @@ type
     pendingSeat: int
     pendingDecision: Decision
     pendingAccepted: bool
+    pendingError: string
+    pendingRaw: string
     fallbacks: seq[int]
     forcedFolds: seq[int]
     decisions: seq[int]
@@ -205,6 +207,56 @@ proc replayPayload(gs: GameState, results: JsonNode): string =
     "results": results
   }
 
+proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, kind, detail,
+    rawReply: string) =
+  discard runtimeConfig
+  var alreadyFinished = false
+  withLock stateLock:
+    if state.finished:
+      alreadyFinished = true
+    else:
+      state.finished = true
+      var final = %*{
+        "type": "final",
+        "done": true,
+        "failed": true,
+        "reason": kind,
+        "seat": seat,
+        "error": truncateRunes(detail, MaxErrorLen)
+      }
+      for slot, socket in state.playerSockets:
+        final["slot"] = %slot
+        try:
+          socket.send($final)
+        except CatchableError:
+          discard
+  if alreadyFinished:
+    return
+  let fullMessage =
+    if rawReply.len > 0:
+      detail & " | raw_reply=" & truncateRunes(rawReply, 500)
+    else:
+      detail
+  let failureJson = %*{
+    "kind": kind,
+    "failed_policy_index": seat,
+    "message": truncateRunes(fullMessage, 2000)
+  }
+  echo "cosino: episode failed (", kind, ", seat ", seat, "): ", detail
+  if state.capture != nil:
+    state.capture.finishCaptureFailed(failureJson)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(
+        failureUri, $failureJson, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
+    except CatchableError as error:
+      echo "cosino: failed to write player_failure.json: ", error.msg
+  sleep(500)
+  quit(1)
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -334,7 +386,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           else:
             seatPrompt = state.prompts[seat]
             seatRegistered = state.registered[seat]
-            seatScripted = not seatRegistered or state.scripted[seat]
+            seatScripted = seatRegistered and state.scripted[seat]
             seatBaseline = state.baselines[seat]
             external = seatRegistered and state.external[seat]
             header = matchHeader()
@@ -353,7 +405,16 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if stopNow:
         break
 
+      if not seatRegistered:
+        let reason = "player seat " & $seat & " did not register before its turn"
+        if capture != nil:
+          withLock stateLock:
+            state.capture.recordRejected(capture, seat, reason, "unregistered",
+              "", nativeStateHash(state.match.sim))
+        failEpisode(runtimeConfig, seat, "player_error", reason, "")
+
       var decision: Decision
+      var submittedRaw = ""
       if external:
         var sent = false
         var pendingSocket: WebSocket
@@ -363,6 +424,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             inc state.decisionId
             state.pendingSeat = seat
             state.pendingAccepted = false
+            state.pendingError = ""
+            state.pendingRaw = ""
             state.playerSockets[seat].send($ %*{
               "type": "observation",
               "id": state.decisionId,
@@ -372,57 +435,92 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         let replyDeadline = min(epochTime() + config.llmTimeoutSeconds.float,
           hardDeadline)
         var accepted = false
+        var extError = ""
         while sent and epochTime() < replyDeadline:
           withLock stateLock:
             accepted = state.pendingAccepted
             if accepted:
               decision = state.pendingDecision
+              submittedRaw = state.pendingRaw
+            elif state.pendingError.len > 0:
+              extError = state.pendingError
+              submittedRaw = state.pendingRaw
+              sent = false
             elif not state.external[seat] or
                 state.playerSockets.getOrDefault(seat) != pendingSocket:
+              extError = "external player disconnected before acting"
               sent = false
-          if accepted:
+          if accepted or extError.len > 0:
             break
           sleep(50)
         withLock stateLock:
           state.pendingSeat = -1
           state.pendingAccepted = false
+          state.pendingError = ""
+          state.pendingRaw = ""
         if not accepted:
-          decision = client.scriptedAction(simCopy, seat, seatBaseline)
-          decision.fallback = true
-        echo "cosino: external ", (if accepted: "accepted" else: "fallback"),
-          " seat ", seat
+          let reason =
+            if extError.len > 0: extError
+            else: "external player timed out waiting for action"
+          if capture != nil:
+            withLock stateLock:
+              state.capture.recordRejected(capture, seat, reason, "external",
+                submittedRaw, nativeStateHash(state.match.sim))
+          failEpisode(runtimeConfig, seat, "player_error", reason, submittedRaw)
+        echo "cosino: external accepted seat ", seat
       else:
         ## Only the game-hosted prompt path calls Claude from this process.
-        decision = client.decide(simCopy, seat, seatPrompt,
-          scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header,
-          capture = capture)
-      if not seatRegistered:
-        decision.fallback = true
+        try:
+          decision = client.decide(simCopy, seat, seatPrompt,
+            scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header,
+            capture = capture)
+        except CosinoFailureError as error:
+          let kind =
+            if error.transportFailure: "episode_inconclusive"
+            else: "player_error"
+          if capture != nil:
+            withLock stateLock:
+              state.capture.recordRejected(capture, seat, error.msg, "model",
+                error.rawReply, nativeStateHash(state.match.sim))
+          failEpisode(runtimeConfig, seat, kind, error.msg, error.rawReply)
+        except CatchableError as error:
+          if capture != nil:
+            withLock stateLock:
+              state.capture.recordRejected(capture, seat, error.msg, "model",
+                "", nativeStateHash(state.match.sim))
+          failEpisode(runtimeConfig, seat, "player_error", error.msg, "")
       inc spent
 
       var handEnded = false
+      var applyErr = ""
       withLock stateLock:
         inc state.decisions[seat]
-        ## Degrade twice, never hang: illegal -> baseline -> fold.
         let beforeEvents = if capture != nil: state.match.sim.events.len else: 0
-        let outcome = client.applyDecision(state.match.sim, seat, decision,
-          seatBaseline)
-        if capture != nil:
-          try:
-            let noModel = not external and not seatScripted and not client.credentialled()
-            state.capture.applied(capture, seat, decision.action, decision.say,
-              state.match.sim.events[beforeEvents ..< state.match.sim.events.len],
-              outcome.fallbacks > 0 or outcome.forcedFolds > 0 or noModel,
-              outcome.forcedFolds > 0,
-              (if not seatRegistered: "unregistered" elif external: "external" elif seatScripted: $seatBaseline else: "model"),
-              $seatBaseline, nativeStateHash(state.match.sim))
-          except CatchableError as error: state.capture.captureError(error.msg)
-        state.fallbacks[seat] += outcome.fallbacks
-        state.forcedFolds[seat] += outcome.forcedFolds
-        if state.match.sim.done:
-          state.match.finishHand()
-          handEnded = true
-        state.broadcastLocked()
+        try:
+          let outcome = client.applyDecision(state.match.sim, seat, decision,
+            seatBaseline)
+          if capture != nil:
+            try:
+              state.capture.applied(capture, seat, decision.action, decision.say,
+                state.match.sim.events[beforeEvents ..< state.match.sim.events.len],
+                false, false,
+                (if external: "external" elif seatScripted: $seatBaseline else: "model"),
+                $seatBaseline, nativeStateHash(state.match.sim))
+            except CatchableError as error: state.capture.captureError(error.msg)
+          state.fallbacks[seat] += outcome.fallbacks
+          state.forcedFolds[seat] += outcome.forcedFolds
+          if state.match.sim.done:
+            state.match.finishHand()
+            handEnded = true
+          state.broadcastLocked()
+        except CatchableError as error:
+          applyErr = error.msg
+          if capture != nil:
+            state.capture.recordRejected(capture, seat, error.msg,
+              (if external: "external" elif seatScripted: $seatBaseline else: "model"),
+              submittedRaw, nativeStateHash(state.match.sim))
+      if applyErr.len > 0:
+        failEpisode(runtimeConfig, seat, "player_error", applyErr, submittedRaw)
 
       if config.turnDelayMs > 0:
         sleep(config.turnDelayMs)
@@ -588,7 +686,10 @@ proc websocketHandler(
           ## in a browser and then fails a strict UTF-8 parser downstream.
           let prompt = truncateRunes(payload{"prompt"}.getStr(), MaxPromptLen)
           let scripted = payload{"scripted"}.getBool(false)
-          let baseline = parseBaseline(payload{"baseline"}.getStr("house"))
+          let baseline =
+            if scripted or payload.hasKey("baseline"):
+              parseBaseline(payload{"baseline"}.getStr("house"))
+            else: blHouse
           withLock stateLock:
             if state.playerSockets.getOrDefault(slot) != websocket:
               return
@@ -618,9 +719,17 @@ proc websocketHandler(
                 state.decisionId == id and not state.pendingAccepted:
               state.pendingDecision = Decision(
                 say: say, action: PlayerAction(kind: kind, amount: amount))
+              state.pendingRaw = message.data
               state.pendingAccepted = true
       except CatchableError as error:
-        echo "cosino: ignoring bad player frame: ", error.msg
+        echo "cosino: bad player frame from slot ", slot, ": ", error.msg
+        withLock stateLock:
+          if state.playerSockets.getOrDefault(slot) == websocket and
+              state.registered[slot] and state.external[slot] and
+              state.pendingSeat == slot and not state.pendingAccepted and
+              state.pendingError.len == 0:
+            state.pendingError = "invalid external action frame: " & error.msg
+            state.pendingRaw = message.data
     of ErrorEvent, CloseEvent:
       withLock stateLock:
         if websocket in state.socketSlots:
