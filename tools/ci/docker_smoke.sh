@@ -225,12 +225,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         req = json.loads(body)
         user = req["messages"][0]["content"]
         calls += 1
-        if '"bet"' in user and calls % 3 == 1:
-            action, say = "bet", "Let us make it interesting."
-        elif '"check"' in user:
-            action, say = "check", "Tap tap."
+        if '"check"' in user:
+            action = "bet" if ('"bet"' in user and calls % 2 == 1) else "check"
         else:
-            action, say = "call", "I will pay to see it."
+            action = "fold" if calls % 3 == 1 else "call"
+        say = "Tap tap." if calls % 4 == 0 else ""
         raw_obj = json.dumps({"say": say, "action": action})
         text = f"```json\n{raw_obj}\n```" if calls % 2 == 0 else raw_obj
         with log_file.open("a", encoding="utf-8") as fh:
