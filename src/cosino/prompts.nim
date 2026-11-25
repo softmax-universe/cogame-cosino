@@ -79,13 +79,13 @@ proc matchBriefing*(selection: PromptSelection, stack: int, chipRace: bool): str
     "Ladder reference: all-seat starting stack {stack}, reset each hand. Match score: cumulative net chips. Value equivalence: one saved chip equals one won chip.\n"
   ]
   let conduct = [
-    "- Table talk is public and free. Bluff, needle and mislead — but your cards stay secret until\n  showdown.\n- Pick exactly one action from the legal list you are given, with an amount inside the stated\n  range. An illegal answer is replaced by a house baseline move, which is never what you want.\n\n",
-    "Table talk is public and free: bluff, needle, and mislead while keeping cards secret until showdown. Choose exactly one listed legal action and keep its amount within the stated range. An illegal answer is replaced by a house baseline move, which you do not want.\n\n",
-    "Table conduct:\n1. Talk is public and free; bluff, needle, and mislead.\n2. Your cards stay secret until showdown.\n3. Select exactly one listed legal action, with an amount in the stated range.\n4. Illegal answers trigger an unwanted house baseline move.\n\n",
-    "Can you talk? Yes, publicly and for free: bluff, needle, and mislead. When are your cards revealed? At showdown. What action may you choose? Exactly one from the supplied legal list, with an amount in range. What if it is illegal? An unwanted house baseline move replaces it.\n\n",
-    "Choose exactly one action from the legal list and an amount within its range; otherwise an unwanted house baseline move replaces your answer. Table talk is public and free, so bluff, needle, and mislead. Cards remain secret until showdown.\n\n",
-    "Table briefing: talk publicly at no cost; bluff, needle, and mislead, with cards hidden until showdown. Select one legal listed action and a permitted amount. Avoid illegal answers, which are replaced by an unwanted house baseline move.\n\n",
-    "Conduct reference: table talk public/free; bluffing, needling, misleading allowed; cards secret until showdown. Action contract: exactly one listed legal action, amount in range. Illegal answer: unwanted house baseline substitution.\n\n"
+    "- Table talk is public and free. Bluff, needle and mislead — but your cards stay secret until\n  showdown.\n- Pick exactly one action from the legal list you are given, with an amount inside the stated\n  range. An illegal or invalid answer is rejected and fails the turn.\n\n",
+    "Table talk is public and free: bluff, needle, and mislead while keeping cards secret until showdown. Choose exactly one listed legal action and keep its amount within the stated range. An illegal or invalid answer is rejected and fails the turn.\n\n",
+    "Table conduct:\n1. Talk is public and free; bluff, needle, and mislead.\n2. Your cards stay secret until showdown.\n3. Select exactly one listed legal action, with an amount in the stated range.\n4. Illegal or invalid answers are rejected and fail the turn.\n\n",
+    "Can you talk? Yes, publicly and for free: bluff, needle, and mislead. When are your cards revealed? At showdown. What action may you choose? Exactly one from the supplied legal list, with an amount in range. What if it is illegal? It is rejected and fails the turn.\n\n",
+    "Choose exactly one action from the legal list and an amount within its range; an illegal or invalid answer is rejected and fails the turn. Table talk is public and free, so bluff, needle, and mislead. Cards remain secret until showdown.\n\n",
+    "Table briefing: talk publicly at no cost; bluff, needle, and mislead, with cards hidden until showdown. Select one legal listed action and a permitted amount. Illegal or invalid answers are rejected and fail the turn.\n\n",
+    "Conduct reference: table talk public/free; bluffing, needling, misleading allowed; cards secret until showdown. Action contract: exactly one listed legal action, amount in range. Illegal or invalid answer: rejected, fails the turn.\n\n"
   ]
   let index = ord(selection.selectedVariant)
   (if chipRace: race[index] else: ladder[index]).replace("{stack}", $stack) & conduct[index]

@@ -73,66 +73,80 @@ suite "bounded orders: the baseline is always legal":
           check netSum == 0
           check abs(total - 1.0) < 1e-9
 
-suite "degrade, never hang":
-  test "decide with no credentials returns the scripted move immediately":
+suite "strict decision contract: no implicit fallbacks":
+  test "decide with no credentials raises transport failure instead of scripted fallback":
     var config = fixture(vHoldem, 3, 11)
-    let client = newLlmClient(config)
+    let client = newScriptedClient(config)
     check not client.credentialled()
     var match = initMatch(config)
     let seat = match.sim.actingSeat
     let started = getMonoTime()
-    let decision = client.decide(match.sim, seat, "raise every hand", selection = PromptSelection(),
-      scripted = false)
+    var raised = false
+    var transport = false
+    try:
+      discard client.decide(match.sim, seat, "raise every hand",
+        selection = PromptSelection(), scripted = false)
+    except CosinoFailureError as err:
+      raised = true
+      transport = err.transportFailure
     let elapsed = (getMonoTime() - started).inMilliseconds
-    ## No network wait at all: no retries, no spacing floor, no timeout.
+    check raised
+    check transport
     check elapsed < 500
+
+  test "explicit scripted seats still run their chosen baseline":
+    var config = fixture(vHoldem, 3, 11)
+    let client = newScriptedClient(config)
+    var match = initMatch(config)
+    let seat = match.sim.actingSeat
+    let decision = client.decide(match.sim, seat, "",
+      selection = PromptSelection(), scripted = true, baseline = blHouse)
     check not decision.fallback
     match.sim.applyAction(seat, decision.action)
 
-  test "an unparseable reply cannot reach the engine":
-    for garbage in ["", "I think I will raise", "```\nnope\n```"]:
+  test "extractJsonObject accepts plain JSON and standard outer markdown fence only":
+    let plain = extractJsonObject("""{"say": "", "action": "check"}""")
+    check plain["action"].getStr() == "check"
+    let fenced = extractJsonObject("```json\n{\"say\": \"hi\", \"action\": \"fold\"}\n```")
+    check fenced["action"].getStr() == "fold"
+    let bareFence = extractJsonObject("```\n{\"action\": \"call\"}\n```")
+    check bareFence["action"].getStr() == "call"
+    for garbage in [
+      "",
+      "I think I will raise",
+      "```\nnope\n```",
+      "Here is my move: {\"action\": \"fold\"}",
+      "{\"action\": \"fold\"} thanks!",
+      "```yaml\n{\"action\": \"fold\"}\n```",
+      "[1, 2, 3]"
+    ]:
       expect CosinoError:
         discard extractJsonObject(garbage)
 
-  test "an illegal action falls back to the baseline and increments fallbacks":
+  test "an illegal action raises without mutating sim or substituting baseline":
     var config = fixture(vHoldem, 3, 12)
-    let client = newLlmClient(config)
+    let client = newScriptedClient(config)
     var match = initMatch(config)
     let seat = match.sim.actingSeat
+    let beforeEvents = match.sim.events.len
     ## A raise far beyond the stack: the engine rejects it outright.
     let bogus = Decision(say: "shove",
       action: PlayerAction(kind: akRaise, amount: 10_000))
-    let outcome = client.applyDecision(match.sim, seat, bogus)
-    check outcome.fallbacks == 1
-    check outcome.forcedFolds == 0
-    check match.sim.actingSeat != seat or match.sim.done
+    expect CosinoError:
+      discard client.applyDecision(match.sim, seat, bogus)
+    check match.sim.actingSeat == seat
+    check match.sim.events.len == beforeEvents
 
-  test "a model fallback is counted even when its action is legal":
-    var config = fixture(vHoldem, 3, 13)
-    let client = newLlmClient(config)
+  test "call when facing zero stays akCall and is rejected by the engine":
+    var config = fixture(vKuhn, 2, 13)
+    let client = newScriptedClient(config)
     var match = initMatch(config)
     let seat = match.sim.actingSeat
-    var decision = client.scriptedAction(match.sim, seat)
-    decision.fallback = true
-    decision.error = "llm throttled (429)"
-    let outcome = client.applyDecision(match.sim, seat, decision)
-    check outcome.fallbacks == 1
-    check outcome.forcedFolds == 0
-
-  test "a baseline the engine rejects yields a fold and a forcedFold":
-    var config = fixture(vHoldem, 3, 14)
-    let client = newLlmClient(config)
-    var match = initMatch(config)
-    let seat = match.sim.actingSeat
-    let bogus = Decision(action: PlayerAction(kind: akRaise, amount: 10_000))
-    ## A deliberately broken baseline: checking is illegal facing the blind.
-    proc brokenBaseline(sim: Sim, seat: int): PlayerAction =
-      PlayerAction(kind: akCheck)
-    let outcome = client.applyDecision(match.sim, seat, bogus,
-      baselineFor = brokenBaseline)
-    check outcome.fallbacks == 1
-    check outcome.forcedFolds == 1
-    check match.sim.seats[seat].folded
+    check match.sim.callAmount(seat) == 0
+    let parsed = parseDecision(match.sim, seat, %*{"action": "call", "say": ""})
+    check parsed.action.kind == akCall
+    expect CosinoError:
+      discard client.applyDecision(match.sim, seat, parsed)
 
 suite "hostile model output":
   test "a 5 kB emoji say is capped at 120 runes and the replay stays UTF-8":
@@ -161,19 +175,23 @@ suite "hostile model output":
         check node["text"].getStr().runeLen == MaxSayLen
     check found
 
-  test "unknown verbs are rejected, allin normalises":
+  test "unknown verbs and non-canonical aliases are rejected":
     var config = fixture(vHoldem, 3, 16)
     var match = initMatch(config)
     let seat = match.sim.actingSeat
+    for alias in ["teleport", "allin", "all-in", "all in", "shove", ""]:
+      expect CosinoError:
+        discard parseDecision(match.sim, seat, %*{"action": alias})
     expect CosinoError:
-      discard parseDecision(match.sim, seat, %*{"action": "teleport"})
-    let shove = parseDecision(match.sim, seat, %*{"action": "shove"})
-    check shove.action.kind in [akBet, akRaise, akCall]
-    match.sim.applyAction(seat, shove.action)
+      discard parseDecision(match.sim, seat, %*{"action": "fold", "say": false})
+    expect CosinoError:
+      discard parseDecision(match.sim, seat, %*{"action": "bet", "amount": "10"})
 
-  test "baselines are selected by name, anything else is house":
+  test "baselines require explicit house or rock":
     check parseBaseline("rock") == blRock
     check parseBaseline("ROCK") == blRock
     check parseBaseline("house") == blHouse
-    check parseBaseline("") == blHouse
-    check parseBaseline("whatever") == blHouse
+    check parseBaseline("HOUSE") == blHouse
+    for bad in ["", "whatever", "true", "1"]:
+      expect CosinoError:
+        discard parseBaseline(bad)

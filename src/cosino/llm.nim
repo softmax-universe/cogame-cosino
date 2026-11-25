@@ -7,10 +7,9 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal scripted
-## baseline immediately (no retries, no network waits) so offline
-## certification still completes — this fallback is load-bearing. The same
-## baselines are fieldable policies: PLAYER_SCRIPTED=house|rock.
+## Prompt seats require a working model endpoint and never fall back to a
+## scripted baseline. Explicit baselines are fieldable policies:
+## PLAYER_SCRIPTED=house|rock.
 
 import
   std/[json, math, monotimes, os, random, strutils, times],
@@ -30,11 +29,15 @@ type
     blHouse = "house"
     blRock = "rock"
 
+  CosinoFailureError* = object of CosinoError
+    transportFailure*: bool
+    rawReply*: string
+
   Decision* = object
     say*: string
     action*: PlayerAction
-    fallback*: bool    ## the scripted baseline played instead of the model
-    error*: string     ## why, rune-truncated for the replay
+    fallback*: bool    ## retained for compatibility; always false for model play
+    error*: string     ## why, rune-truncated for diagnostics
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -57,8 +60,12 @@ type
     rand: Rand
 
 proc parseBaseline*(text: string): Baseline =
-  ## Any non-empty value that is not `rock` means `house`.
-  if text.strip().toLowerAscii() == "rock": blRock else: blHouse
+  ## Parses an explicit baseline name (`house` or `rock`).
+  case text.strip().toLowerAscii()
+  of "house": blHouse
+  of "rock": blRock
+  else:
+    raise newException(CosinoError, "unknown baseline: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -144,7 +151,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "cosino llm: no LLM credentials; using scripted fallback"
+    echo "cosino llm: no LLM credentials configured"
 
 proc credentialled*(client: LlmClient): bool =
   not client.disabled and client.transport != ltNone
@@ -477,8 +484,8 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
     if config.chipRace: "table" else: "ladder") & "\n\n" &
     variantRules(config) & "\n\n" &
     selection.matchBriefing(config.startingStack, config.chipRace) &
-    "Reply with a single JSON object and NOTHING else. Your reply MUST " &
-    "begin with the character `{`."
+    "Reply with a single JSON object (optionally wrapped in a ```json code fence) " &
+    "and NOTHING else."
 
 proc renderHistory(sim: Sim, viewer: int): string =
   ## The current hand's public record, in reading order. Hole cards are
@@ -584,16 +591,19 @@ proc actionInstruction(sim: Sim, seat: int): string =
   else:
     if sim.canBet(seat):
       options.add("\"bet\" with \"amount\" between " &
-        $sim.minBet(seat) & " and " & $sim.maxRaiseTo(seat))
+        $sim.minBet(seat) & " and " & $sim.maxRaiseTo(seat) &
+        " (" & $sim.maxRaiseTo(seat) & " is ALL-IN)")
     elif sim.canRaise(seat):
       options.add("\"raise\" with \"amount\" (raise TO a street total) " &
-        "between " & $sim.minRaiseTo(seat) & " and " & $sim.maxRaiseTo(seat))
-    options.add("\"allin\" (shove your whole stack)")
+        "between " & $sim.minRaiseTo(seat) & " and " & $sim.maxRaiseTo(seat) &
+        " (" & $sim.maxRaiseTo(seat) & " is ALL-IN)")
+  let exampleAction = if price == 0: "check" else: "call"
   "It is your turn. Say one short line to the table (max " & $MaxSayLen &
     " characters, may be empty) and pick exactly one action.\n" &
     "Legal actions: " & options.join(", ") & ".\n" &
     "Respond with JSON: {\"say\": \"...\", \"action\": \"...\", " &
-    "\"amount\": <number, only for bet/raise>}"
+    "\"amount\": <number, only for bet/raise>}\n" &
+    "Example: {\"say\": \"\", \"action\": \"" & exampleAction & "\"}"
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string,
     header: string): string =
@@ -617,13 +627,28 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string,
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses a single JSON object, optionally wrapped in a standard outer
+  ## Markdown code fence (```json ... ``` or ``` ... ```).
+  var body = text.strip()
+  if body.startsWith("```"):
+    let nl = body.find('\n')
+    if nl < 0:
+      raise newException(CosinoError, "unterminated markdown fence in response")
+    let tag = body[3 ..< nl].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(CosinoError, "unsupported markdown fence language: " & tag)
+    body = body[nl + 1 .. ^1].strip()
+    if not body.endsWith("```"):
+      raise newException(CosinoError, "unterminated markdown fence in response")
+    body = body[0 ..< body.len - 3].strip()
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
     raise newException(CosinoError, "no JSON object in response")
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(body)
+  except CatchableError as error:
+    raise newException(CosinoError, "invalid JSON in response: " & error.msg)
+  if result.kind != JObject:
+    raise newException(CosinoError, "JSON response must be an object")
 
 proc completeText(client: LlmClient, system, user: string, slot: int,
     capture: CapturedDecision = nil): string =
@@ -690,33 +715,35 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
       result.add(contentBlock{"text"}.getStr())
 
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## Maps the model's JSON onto a legal PlayerAction, or raises.
-  result.say = truncateRunes(payload{"say"}.getStr().strip(), MaxSayLen)
-  let verb = payload{"action"}.getStr().strip().toLowerAscii()
-  let amount = payload{"amount"}.getInt(0)
-  let price = sim.callAmount(seat)
+  ## Maps the model's JSON onto a canonical PlayerAction, or raises.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(CosinoError, "decision payload must be a JSON object")
+  if not payload.hasKey("action") or payload["action"].kind != JString:
+    raise newException(CosinoError, "missing string action field")
+  if payload.hasKey("say") and payload["say"].kind notin {JString, JNull}:
+    raise newException(CosinoError, "say must be a string")
+  if payload.hasKey("amount") and payload["amount"].kind notin {JInt, JNull}:
+    raise newException(CosinoError, "amount must be an integer")
+  result.say =
+    if payload.hasKey("say") and payload["say"].kind == JString:
+      truncateRunes(payload["say"].getStr().strip(), MaxSayLen)
+    else: ""
+  let verb = payload["action"].getStr().strip().toLowerAscii()
+  let amount =
+    if payload.hasKey("amount") and payload["amount"].kind == JInt:
+      payload["amount"].getInt()
+    else: 0
   case verb
   of "fold":
     result.action = PlayerAction(kind: akFold)
   of "check":
     result.action = PlayerAction(kind: akCheck)
   of "call":
-    result.action = PlayerAction(
-      kind: if price == 0: akCheck else: akCall)
+    result.action = PlayerAction(kind: akCall)
   of "bet":
     result.action = PlayerAction(kind: akBet, amount: amount)
   of "raise":
     result.action = PlayerAction(kind: akRaise, amount: amount)
-  of "allin", "all-in", "all in", "shove":
-    let ceiling = sim.maxRaiseTo(seat)
-    if sim.currentBet == 0:
-      result.action = PlayerAction(kind: akBet, amount: ceiling)
-    elif ceiling <= sim.currentBet or not sim.canRaise(seat):
-      ## Covered by the bet (or barred from raising): the shove is a call.
-      result.action = PlayerAction(
-        kind: if price == 0: akCheck else: akCall)
-    else:
-      result.action = PlayerAction(kind: akRaise, amount: ceiling)
   else:
     raise newException(CosinoError, "unknown action: " & verb)
 
@@ -725,37 +752,25 @@ type
     fallbacks*: int
     forcedFolds*: int
 
+proc validateDecision*(sim: Sim, seat: int, decision: Decision) =
+  ## Validates a decision against the engine without mutating `sim`.
+  var probe = sim
+  probe.applyAction(seat, decision.action)
+
 proc applyDecision*(
   client: LlmClient,
   sim: var Sim,
   seat: int,
   decision: Decision,
-  baseline = blHouse,
-  baselineFor: proc (sim: Sim, seat: int): PlayerAction {.closure.} = nil
+  baseline = blHouse
 ): ApplyOutcome =
-  ## Records the table talk and plays the action, degrading twice so the hand
-  ## can never stall: an illegal model action falls back to the seat's
-  ## scripted baseline, and a baseline the engine also rejects folds, which is
-  ## always legal. `baselineFor` is a seam for the tests.
-  if decision.fallback:
-    inc result.fallbacks
+  ## Validates and applies the decision to `sim`. Raises CosinoError on any
+  ## illegal action without substituting a baseline move or forced fold.
+  discard client
+  discard baseline
+  validateDecision(sim, seat, decision)
   sim.recordSay(seat, decision.say)
-  try:
-    sim.applyAction(seat, decision.action)
-    return
-  except CosinoError as error:
-    echo "cosino: action rejected (", error.msg, "); using the baseline"
-    inc result.fallbacks
-  let fallback =
-    if baselineFor.isNil: client.scriptedAction(sim, seat, baseline).action
-    else: baselineFor(sim, seat)
-  try:
-    sim.applyAction(seat, fallback)
-    return
-  except CosinoError as inner:
-    echo "cosino: baseline rejected too (", inner.msg, "); folding"
-    inc result.forcedFolds
-  sim.applyAction(seat, PlayerAction(kind: akFold))
+  sim.applyAction(seat, decision.action)
 
 proc waitForSpacing(client: LlmClient) =
   ## Wall-clock floor from decision start to decision start; the Bedrock
@@ -776,34 +791,53 @@ proc decide*(
   header = "",
   capture: CapturedDecision = nil
 ): Decision =
-  ## One decision for one seat. Never raises: any failure degrades to the
-  ## scripted baseline so the game always advances.
-  if scripted or client.disabled:
+  ## One decision for one seat. Scripted seats run their explicit baseline.
+  ## Model seats call the configured LLM endpoint and raise CosinoFailureError
+  ## on missing credentials, transport failure, or rejected output — never
+  ## substituting a scripted action.
+  if scripted:
     return client.scriptedAction(sim, seat, baseline)
+  if client.disabled or client.transport == ltNone:
+    var err = newException(CosinoFailureError,
+      "no LLM credentials configured for model player")
+    err.transportFailure = true
+    raise err
   client.waitForSpacing()
   let system = systemPrompt(sim, seat, selection)
   var lastError = ""
+  var lastRawReply = ""
+  var transportFailure = false
   for attempt in 0 .. 1:
     var user = userPrompt(sim, seat, prompt, header)
     if attempt > 0:
-      user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-        "requested JSON object and a legal action with a legal amount.")
+      user.add("\nYour previous reply was invalid (" & lastError &
+        "). Respond with ONLY the requested JSON object and a legal action " &
+        "with a legal amount.")
     if capture != nil: capture.beginAttempt()
+    var text: string
     try:
-      let text = client.completeText(system, user, seat, capture)
-      if capture != nil: capture.replyText(text)
-      let payload = extractJsonObject(text)
-      result = parseDecision(sim, seat, payload)
-      if capture != nil: capture.parsedProposal(result.action, result.say)
-      return
+      text = client.completeText(system, user, seat, capture)
     except CatchableError as error:
       if capture != nil: capture.rejectedAttempt(error.msg)
       lastError = error.msg
-      echo "cosino llm: seat ", seat, " attempt ", attempt, " failed: ",
+      transportFailure = true
+      echo "cosino llm: seat ", seat, " attempt ", attempt, " transport failed: ",
         error.msg
-      if client.disabled or "429" in error.msg:
-        break
-  echo "cosino llm: seat ", seat, " falling back to scripted decision"
-  result = client.scriptedAction(sim, seat, baseline)
-  result.fallback = true
-  result.error = truncateRunes(lastError, MaxErrorLen)
+      break
+    if capture != nil: capture.replyText(text)
+    lastRawReply = text
+    try:
+      let payload = extractJsonObject(text)
+      let candidate = parseDecision(sim, seat, payload)
+      if capture != nil: capture.parsedProposal(candidate.action, candidate.say)
+      validateDecision(sim, seat, candidate)
+      return candidate
+    except CatchableError as error:
+      if capture != nil: capture.rejectedAttempt(error.msg)
+      lastError = error.msg
+      echo "cosino llm: seat ", seat, " attempt ", attempt, " rejected: ",
+        error.msg
+  var err = newException(CosinoFailureError, lastError)
+  err.transportFailure = transportFailure
+  err.rawReply = lastRawReply
+  raise err

@@ -111,8 +111,7 @@ External policies may select any bet or raise amount in the game's complete
 legal range.
 
 - **`house`** — the exact α = 1/6 Kuhn equilibrium (measured exploitability 0),
-  a Leduc rule table, and a Chen-formula no-limit bot. It is also the fallback
-  whenever a model decision fails.
+  a Leduc rule table, and a Chen-formula no-limit bot.
 - **`rock`** — deterministic, never bluffs, deliberately exploitable.
 
 The repo's own set is in `tools/ci/policies.json`.
@@ -178,8 +177,10 @@ for t in tests/*.nim; do nim r --hints:off --path:src "$t"; done
   game-block name shadowing a chrome alias, every scrubber beat kind has CSS)
   then every `tests/*.nim` twice, debug and `-d:release`.
 - **`docker-smoke`** — builds the production image and runs one real episode of
-  the certification fixture in raw docker with **no** `ANTHROPIC_API_KEY`, so
-  both seats play scripted. It uploads the normal replay as `smoke-replay`.
+  the certification fixture in raw docker against a local deterministic HTTP
+  model endpoint (`COWORLD_LLM_ENDPOINT`), verifying both the ordinary model
+  seat and the explicit house baseline seat. It uploads the normal replay as
+  `smoke-replay`.
 - **`wasm-viewer`** — builds the static bundle and **executes** it in headless
   Chromium three times: against the smoke replay, the committed six-max
   fixture `tools/ci/fixtures/sixmax_audit.replay` (two flagged pairs and a
