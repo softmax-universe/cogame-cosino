@@ -224,9 +224,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8")
         req = json.loads(body)
         user = req["messages"][0]["content"]
-        action = "check" if '"check"' in user else "call"
         calls += 1
-        raw_obj = json.dumps({"say": "", "action": action})
+        if '"bet"' in user and calls % 3 == 1:
+            action, say = "bet", "Let us make it interesting."
+        elif '"check"' in user:
+            action, say = "check", "Tap tap."
+        else:
+            action, say = "call", "I will pay to see it."
+        raw_obj = json.dumps({"say": say, "action": action})
         text = f"```json\n{raw_obj}\n```" if calls % 2 == 0 else raw_obj
         with log_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"call": calls, "slot": self.headers.get("X-Coworld-Player-Slot"), "action": action}) + "\n")
